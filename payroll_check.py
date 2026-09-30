@@ -23,6 +23,7 @@ comparable to CTC):
 import io
 import re
 from dataclasses import dataclass, field
+from datetime import date
 
 import msoffcrypto
 import openpyxl
@@ -33,9 +34,44 @@ import pandas as pd
 # update here if rates change)
 # ----------------------------------------------------------------------
 PF_RATE = 0.12
-PF_CAP = 1800
 ESI_RATE = 0.0075
 ESI_WAGE_CEILING = 21000
+
+# EPF wage ceiling change: Notification S.O. 5109(E) dated 17 September 2026
+# raised the statutory PF wage ceiling from Rs. 15,000/month to Rs. 25,000/month,
+# effective from the date of publication (17 Sept 2026). This does NOT change
+# the ESI wage ceiling above. For the transition month itself (Sept 2026),
+# contribution is computed on a split basis: the old ceiling for days before
+# the effective date, the new ceiling from the effective date onward --
+# see compute_pf_wage_ceiling() below, which generalizes this so any future
+# similar mid-month ceiling change can be handled by just updating the
+# constants here.
+PF_WAGE_CEILING_OLD = 15000
+PF_WAGE_CEILING_NEW = 25000
+PF_CEILING_CHANGE_DATE = date(2026, 9, 17)
+
+
+def compute_pf_wage_ceiling(payroll_year: int, payroll_month: int, days_in_month: float) -> float:
+    """Returns the effective PF wage ceiling for the given payroll month,
+    blending old/new ceilings for the one transition month itself (a
+    day-weighted average, matching EPFO's own illustration for Sept 2026:
+    16 days at the Rs 15,000 ceiling + 14 days at the Rs 25,000 ceiling
+    = Rs 19,667 effective ceiling for that month)."""
+    month_start = date(payroll_year, payroll_month, 1)
+    change_month_start = date(PF_CEILING_CHANGE_DATE.year, PF_CEILING_CHANGE_DATE.month, 1)
+
+    if month_start < change_month_start:
+        return PF_WAGE_CEILING_OLD
+    if month_start > change_month_start:
+        return PF_WAGE_CEILING_NEW
+
+    # Transition month itself: blend by days before/from the effective date.
+    pre_days = PF_CEILING_CHANGE_DATE.day - 1
+    post_days = max(days_in_month - pre_days, 0)
+    if days_in_month <= 0:
+        return PF_WAGE_CEILING_NEW
+    return (PF_WAGE_CEILING_OLD * pre_days + PF_WAGE_CEILING_NEW * post_days) / days_in_month
+
 
 PT_SLABS_CHENNAI = [  # (gross_from, gross_to_inclusive, pt_amount)
     (0, 3500, 0),
@@ -204,10 +240,12 @@ class CheckResults:
     not_in_bank_master: pd.DataFrame
     total_employees: int
     days_in_month: float = 30
+    pf_wage_ceiling: float = None
     warnings: list = field(default_factory=list)
 
 
-def run_checks(salary_df, bank_df, ctc_df, prev_ctc_df, bank_master_df) -> CheckResults:
+def run_checks(salary_df, bank_df, ctc_df, prev_ctc_df, bank_master_df,
+                payroll_year: int = None, payroll_month: int = None) -> CheckResults:
     warnings = []
 
     # --- column resolution (tolerant to minor header wording changes) ---
@@ -391,6 +429,24 @@ def run_checks(salary_df, bank_df, ctc_df, prev_ctc_df, bank_master_df) -> Check
             "then re-upload."
         )
 
+    if payroll_year is None or payroll_month is None:
+        # Can't know which month this is, so can't know which PF wage ceiling
+        # applies (Rs 15,000 before 17-Sep-2026, Rs 25,000 from 17-Sep-2026,
+        # a same blended figure for Sept 2026 itself). Falling back to the
+        # ceiling in effect *today* would silently misprice PF for any
+        # historical month, which is worse than just saying so.
+        pf_wage_ceiling = PF_WAGE_CEILING_NEW
+        warnings.append(
+            "Payroll month/year wasn't provided, so PF was checked against the "
+            f"current Rs {PF_WAGE_CEILING_NEW:,} wage ceiling. If this Pay Register "
+            "is for a month before September 2026, or is September 2026 itself, "
+            "the PF exceptions below may be wrong -- re-run with the payroll month "
+            "specified."
+        )
+    else:
+        pf_wage_ceiling = compute_pf_wage_ceiling(payroll_year, payroll_month, days_in_month)
+    pf_cap = pf_wage_ceiling * PF_RATE
+
     factor = salary_days / days_in_month
     exp_basic = ctc_basic * factor
     exp_hra = ctc_hra * factor
@@ -442,9 +498,9 @@ def run_checks(salary_df, bank_df, ctc_df, prev_ctc_df, bank_master_df) -> Check
     # must be on the uncapped basis.
     c_ctc_pf_emp = find_col(ctc_df.columns, "pf", "employee")
     ctc_pf_full_month = ctc_val(c_ctc_pf_emp) if c_ctc_pf_emp else pd.Series(0.0, index=df.index)
-    is_uncapped_pf = ctc_pf_full_month > (PF_CAP + DIFF_TOLERANCE)
+    is_uncapped_pf = ctc_pf_full_month > (pf_cap + DIFF_TOLERANCE)
 
-    pf_capped = (wages_new_model * PF_RATE).clip(upper=PF_CAP)
+    pf_capped = (wages_new_model * PF_RATE).clip(upper=pf_cap)
     pf_uncapped = exp_basic * PF_RATE
     pf_expected = pf_uncapped.where(is_uncapped_pf, pf_capped)
 
@@ -555,6 +611,7 @@ def run_checks(salary_df, bank_df, ctc_df, prev_ctc_df, bank_master_df) -> Check
         not_in_bank_master=not_in_bank_master,
         total_employees=len(df),
         days_in_month=days_in_month,
+        pf_wage_ceiling=pf_wage_ceiling,
         warnings=warnings,
     )
 
@@ -580,6 +637,7 @@ def write_report(results: CheckResults) -> bytes:
     ws_summary.append([])
     ws_summary.append(["Total employees in pay register", results.total_employees])
     ws_summary.append(["Days in month used for proration (auto-detected)", results.days_in_month])
+    ws_summary.append(["PF wage ceiling used for this month", results.pf_wage_ceiling])
     ws_summary.append(["CTC changes requiring HR approval", len(results.ctc_changes)])
     ws_summary.append(["Salary calculation exceptions", len(results.salary_exceptions)])
     ws_summary.append(["Bank detail mismatches", len(results.bank_mismatches)])
