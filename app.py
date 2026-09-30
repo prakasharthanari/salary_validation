@@ -125,6 +125,21 @@ with st.container(border=True):
     prev_ctc_pw = c3.text_input("Password (if protected)", type="password", key="prev_ctc_pw")
     bank_master_file = c4.file_uploader("Bank Master export (.xlsx)", type=["xlsx"], key="bank_master")
 
+    st.markdown("##### 3. Which month is this?")
+    st.caption(
+        "Needed to apply the correct PF wage ceiling -- Rs 15,000 before "
+        "17-Sep-2026, a blended figure for Sept 2026 itself, Rs 25,000 from "
+        "Oct 2026 onward."
+    )
+    m1, m2 = st.columns(2)
+    month_names = ["January", "February", "March", "April", "May", "June", "July",
+                   "August", "September", "October", "November", "December"]
+    from datetime import date as _date
+    today = _date.today()
+    payroll_month_name = m1.selectbox("Payroll Month", month_names, index=today.month - 1)
+    payroll_month = month_names.index(payroll_month_name) + 1
+    payroll_year = m2.number_input("Payroll Year", min_value=2020, max_value=2100, value=today.year, step=1)
+
     run = st.button("Run Validation", type="primary")
 
 if run:
@@ -145,7 +160,10 @@ if run:
             bank_master_df = pc.load_bank_master(bank_master_file.getvalue()) if bank_master_file else None
 
         with st.spinner("Running checks..."):
-            results = pc.run_checks(salary_df, bank_df, ctc_df, prev_ctc_df, bank_master_df)
+            results = pc.run_checks(
+                salary_df, bank_df, ctc_df, prev_ctc_df, bank_master_df,
+                payroll_year=int(payroll_year), payroll_month=payroll_month,
+            )
 
         st.session_state["results"] = results
     except ValueError as e:
@@ -161,6 +179,8 @@ if st.session_state.get("results"):
     with st.container(border=True):
         st.markdown("##### Results")
         st.caption(f"Days in month used for proration (auto-detected): **{int(results.days_in_month)}**")
+        if results.pf_wage_ceiling:
+            st.caption(f"PF wage ceiling used: **Rs {results.pf_wage_ceiling:,.0f}**")
         m1, m2, m3 = st.columns(3)
         m1.metric("CTC changes", len(results.ctc_changes))
         m2.metric("Salary exceptions", len(results.salary_exceptions))
